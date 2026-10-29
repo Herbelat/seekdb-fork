@@ -12167,6 +12167,112 @@ int ObLogPlan::prepare_text_retrieval_merge(const ObIArray<ObRawExpr *> &merge_m
   return ret;
 }
 
+// Whether the MATCH expression (or its score) is referenced inside the given expression tree.
+static bool ft_expr_refers_match(ObRawExpr *expr, ObRawExpr *match_expr)
+{
+  bool found = false;
+  if (OB_NOT_NULL(expr)) {
+    if (expr == match_expr) {
+      found = true;
+    } else {
+      for (int64_t i = 0; !found && i < expr->get_param_count(); ++i) {
+        found = ft_expr_refers_match(expr->get_param_expr(i), match_expr);
+      }
+    }
+  }
+  return found;
+}
+
+// A bare MATCH predicate in a filter (or the branches of an AND/OR of such predicates)
+// only decides whether a row matches; the relevance score itself is not consumed.
+static bool ft_filter_consumes_score(ObRawExpr *cond, ObRawExpr *match_expr)
+{
+  bool consumes = false;
+  if (OB_ISNULL(cond) || OB_ISNULL(match_expr)) {
+    consumes = true;
+  } else if (cond == match_expr) {
+    consumes = false;
+  } else if (T_OP_AND == cond->get_expr_type() || T_OP_OR == cond->get_expr_type()
+             || T_OP_BOOL == cond->get_expr_type()) {
+    for (int64_t i = 0; !consumes && i < cond->get_param_count(); ++i) {
+      consumes = ft_filter_consumes_score(cond->get_param_expr(i), match_expr);
+    }
+  } else {
+    // Any other use (comparison against a non-trivial bound, arithmetic, function call)
+    // reads the score value.
+    consumes = ft_expr_refers_match(cond, match_expr);
+  }
+  return consumes;
+}
+
+// Counts MATCH expressions inside a filter tree and detects OR combinations. Both make the
+// score-based filter necessary: an OR can mix several MATCH predicates that the single
+// index scan cannot answer on its own.
+static void ft_scan_match_usage(ObRawExpr *expr, int64_t &match_cnt, bool &has_or)
+{
+  if (OB_NOT_NULL(expr)) {
+    if (T_FUN_MATCH_AGAINST == expr->get_expr_type()) {
+      ++match_cnt;
+    } else if (T_OP_OR == expr->get_expr_type()) {
+      has_or = true;
+    }
+    for (int64_t i = 0; i < expr->get_param_count(); ++i) {
+      ft_scan_match_usage(expr->get_param_expr(i), match_cnt, has_or);
+    }
+  }
+}
+
+// Relevance scores are only needed when the query actually consumes them. A MATCH used
+// purely as a WHERE predicate is already enforced by the inverted index scan (which only
+// emits documents satisfying the match), so computing BM25 per document is redundant.
+static bool ft_need_calc_relevance(const ObDMLStmt *stmt, ObRawExpr *match_expr)
+{
+  bool need = true;
+  if (OB_ISNULL(stmt) || OB_ISNULL(match_expr)) {
+    need = true;
+  } else if (!stmt->is_select_stmt()) {
+    // Be conservative for UPDATE/DELETE and other statements.
+    need = true;
+  } else if (BOOLEAN_MODE == static_cast<ObMatchFunRawExpr *>(match_expr)->get_mode_flag()) {
+    // In boolean mode the score carries the match result itself.
+    need = true;
+  } else if (static_cast<const ObSelectStmt *>(stmt)->has_window_function()
+             || static_cast<const ObSelectStmt *>(stmt)->has_window_function_filter()) {
+    // Window functions may consume the score (rank/order inside OVER), keep it computed.
+    need = true;
+  } else {
+    const ObSelectStmt *select_stmt = static_cast<const ObSelectStmt *>(stmt);
+    need = false;
+    for (int64_t i = 0; !need && i < select_stmt->get_select_items().count(); ++i) {
+      need = ft_expr_refers_match(select_stmt->get_select_items().at(i).expr_, match_expr);
+    }
+    const ObIArray<OrderItem> &order_items = select_stmt->get_order_items();
+    for (int64_t i = 0; !need && i < order_items.count(); ++i) {
+      need = ft_expr_refers_match(order_items.at(i).expr_, match_expr);
+    }
+    for (int64_t i = 0; !need && i < select_stmt->get_group_exprs().count(); ++i) {
+      need = ft_expr_refers_match(select_stmt->get_group_exprs().at(i), match_expr);
+    }
+    for (int64_t i = 0; !need && i < select_stmt->get_having_exprs().count(); ++i) {
+      need = ft_expr_refers_match(select_stmt->get_having_exprs().at(i), match_expr);
+    }
+    int64_t match_cnt = 0;
+    bool has_or = false;
+    for (int64_t i = 0; i < stmt->get_condition_exprs().count(); ++i) {
+      ft_scan_match_usage(stmt->get_condition_exprs().at(i), match_cnt, has_or);
+    }
+    if (match_cnt > 1 || has_or) {
+      // Several MATCH predicates (or an OR mixing them) cannot be answered by the single
+      // inverted index scan, so keep the score-based filtering path.
+      need = true;
+    }
+    for (int64_t i = 0; !need && i < stmt->get_condition_exprs().count(); ++i) {
+      need = ft_filter_consumes_score(stmt->get_condition_exprs().at(i), match_expr);
+    }
+  }
+  return need;
+}
+
 int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
                                            const uint64_t index_table_id,
                                            ObMatchFunRawExpr *match_against,
@@ -12183,7 +12289,12 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
   uint64_t fwd_idx_tid = OB_INVALID_ID;
   uint64_t inv_idx_tid = OB_INVALID_ID;
   ObSEArray<ObAuxTableMetaInfo, 4> index_infos;
-  bool need_calc_relevance = true;
+  bool need_calc_relevance = false;
+  if (OB_NOT_NULL(match_against) && OB_NOT_NULL(get_stmt())) {
+    need_calc_relevance = ft_need_calc_relevance(get_stmt(), match_against);
+  } else {
+    need_calc_relevance = true;
+  }
   ObSEArray<ObExprConstraint, 2> constraints;
   uint64_t docid_col_id = OB_INVALID_ID;
   if (OB_ISNULL(match_against) || OB_ISNULL(get_stmt()) || OB_ISNULL(get_optimizer_context().get_query_ctx())) {

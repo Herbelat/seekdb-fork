@@ -36,7 +36,7 @@ struct ObTextTaaTParam
   ObTextTaaTParam()
     : dim_iter_(nullptr), query_tokens_(nullptr), base_param_(nullptr), allocator_(nullptr),
       bm25_param_est_ctx_(), mode_flag_(sql::ObMatchAgainstMode::NATURAL_LANGUAGE_MODE),
-      function_lookup_mode_(false) {}
+      function_lookup_mode_(false), need_calc_relevance_(true) {}
   ~ObTextTaaTParam() {}
   TO_STRING_KV(K_(base_param), KP_(dim_iter), KP_(query_tokens), K_(bm25_param_est_ctx),
       K_(mode_flag), K_(function_lookup_mode));
@@ -47,6 +47,8 @@ struct ObTextTaaTParam
   ObBM25ParamEstCtx bm25_param_est_ctx_;
   sql::ObMatchAgainstMode mode_flag_;
   bool function_lookup_mode_;
+  // When false the relevance score is never consumed, so BM25 estimation is skipped.
+  bool need_calc_relevance_;
 };
 
 class ObTextTaaTIter final : public ObSRTaaTIterImpl
